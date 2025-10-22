@@ -1,11 +1,14 @@
 import re
 from io import BytesIO
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+import os
 
 import pandas as pd
 import streamlit as st
 import google.generativeai as genai
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 from scrape_youtube_channel import (
     ytdlp_extract_channel_video_ids,
@@ -17,7 +20,7 @@ from scrape_youtube_channel import (
 
 st.set_page_config(page_title="YouTube → Excel (yt-dlp)", page_icon="📊", layout="centered")
 st.title("YouTube Channel → Excel")
-st.write("Paste a YouTube channel link or @handle. The app will extract video Title, Views, Date, and Link and offer an Excel download.")
+st.write("Paste a YouTube channel link or @handle. The app will extract video Title, Views, Date, Link, and Analysis and offer an Excel download.")
 
 
 def normalize_channel_url(u: str) -> str:
@@ -36,23 +39,89 @@ def base_channel_url(u: str) -> str:
     return b.rstrip("/")
 
 
-def build_dataframe(channel_videos_url: str) -> pd.DataFrame:
+def build_dataframe_fast(channel_videos_url: str, gemini_key: Optional[str] = None, model_name: Optional[str] = None, max_workers: int = 10) -> pd.DataFrame:
+    """
+    Extract video details from a YouTube channel using parallel processing and optional Gemini analysis.
+    
+    Args:
+        channel_videos_url: URL to the channel's videos page
+        gemini_key: Optional Gemini API key for title analysis
+        model_name: Optional model name for Gemini analysis
+        max_workers: Number of parallel workers for scraping
+    
+    Returns:
+        DataFrame with video details including optional analysis column
+    """
     video_urls = ytdlp_extract_channel_video_ids(channel_videos_url)
-    rows: List[Dict[str, Any]] = []
     total = len(video_urls)
+    
+    # Thread-safe progress tracking
+    progress_lock = threading.Lock()
+    completed = [0]
     prog = st.progress(0, text=f"Fetching details... 0/{total}")
-    for idx, url in enumerate(video_urls, start=1):
+    
+    # Initialize Gemini if key provided
+    model = None
+    if gemini_key:
+        try:
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel(model_name or "gemini-1.5-flash")
+        except Exception as e:
+            st.warning(f"Gemini init failed: {e}")
+    
+    def fetch_video(url: str) -> Optional[Dict[str, Any]]:
         try:
             details = ytdlp_extract_video_details(url)
-            rows.append(details)
+            
+            # Add analysis inline if model available
+            if model:
+                try:
+                    prompt = (
+                        "Analyze this YouTube video title in 2-3 sentences. Focus only on: "
+                        "(1) What primary emotions does this title trigger? "
+                        "(2) What patterns or hooks are used in the title? "
+                        f"Title: '{details['title']}'"
+                    )
+                    resp = model.generate_content(prompt)
+                    details["analysis"] = (resp.text or "").strip()
+                except Exception:
+                    details["analysis"] = "Analysis unavailable"
+            else:
+                details["analysis"] = ""
+            
+            return details
         except Exception as e:
-            st.warning(f"Failed to fetch: {url} ({e})")
-        if total:
-            prog.progress(min(idx/total, 1.0), text=f"Fetching details... {idx}/{total}")
+            st.warning(f"Failed: {url} ({e})")
+            return None
+    
+    rows = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_url = {executor.submit(fetch_video, url): url for url in video_urls}
+        
+        for future in as_completed(future_to_url):
+            result = future.result()
+            if result:
+                rows.append(result)
+            
+            with progress_lock:
+                completed[0] += 1
+                prog.progress(
+                    min(completed[0]/total, 1.0), 
+                    text=f"Fetching details... {completed[0]}/{total}"
+                )
+    
     if not rows:
-        return pd.DataFrame(columns=["title", "views", "date", "link"])
+        # Create empty DataFrame with proper columns
+        df = pd.DataFrame(data=None, columns=["title", "views", "date", "link", "analysis"])
+        return df
 
-    df = pd.DataFrame(rows, columns=["title", "views", "date", "link"]).copy()
+    df = pd.DataFrame(rows)
+    cols = ["title", "views", "date", "link"]
+    if "analysis" in df.columns:
+        cols.append("analysis")
+    
+    # Reorder columns
+    df = df.reindex(columns=cols)
 
     def date_key(x):
         try:
@@ -60,27 +129,37 @@ def build_dataframe(channel_videos_url: str) -> pd.DataFrame:
         except Exception:
             return datetime.min
 
-    df = df.sort_values(by="date", key=lambda s: s.apply(date_key), ascending=False)
-    return df
+    # Sort by date descending where available
+    df_sorted = df.copy()
+    df_sorted["sort_date"] = df_sorted["date"].apply(date_key)
+    df_sorted = df_sorted.sort_values(by="sort_date", ascending=False)
+    df_sorted = df_sorted.drop(columns=["sort_date"])
+    
+    return df_sorted
 
 
 def analyze_titles_gemini(titles: List[str], api_key: str, model_name: str) -> pd.DataFrame:
     """Return a DataFrame with columns: title, analysis (2-3 sentences)."""
     if not api_key:
-        return pd.DataFrame(columns=["title", "analysis"])
+        # Create empty DataFrame with proper columns
+        df = pd.DataFrame(data=None, columns=["title", "analysis"])
+        return df
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(model_name or "gemini-1.5-flash")
     except Exception as e:
         st.error(f"Failed to initialize Gemini: {e}")
-        return pd.DataFrame(columns=["title", "analysis"])
+        # Create empty DataFrame with proper columns
+        df = pd.DataFrame(data=None, columns=["title", "analysis"])
+        return df
 
     rows = []
     for t in titles:
         prompt = (
-            "Analyze this YouTube video title and write a concise 2-3 sentence summary focusing on: "
-            "(1) the primary emotions it targets, and (2) any pattern or hook used. "
-            "Be direct and on-point. Title: '" + t + "'"
+            "Analyze this YouTube video title in 2-3 sentences. Focus only on: "
+            "(1) What primary emotions does this title trigger? "
+            "(2) What patterns or hooks are used in the title? "
+            "Title: '" + t + "'"
         )
         try:
             resp = model.generate_content(prompt)
@@ -88,7 +167,14 @@ def analyze_titles_gemini(titles: List[str], api_key: str, model_name: str) -> p
         except Exception as e:
             text = f"Analysis unavailable: {e}"
         rows.append({"title": t, "analysis": text})
-    return pd.DataFrame(rows, columns=["title", "analysis"]) 
+    
+    # Create DataFrame with proper columns
+    if rows:
+        df = pd.DataFrame(rows)
+        df = df.reindex(columns=["title", "analysis"])
+    else:
+        df = pd.DataFrame(data=None, columns=["title", "analysis"])
+    return df
 
 
 def list_gemini_models(api_key: str) -> List[str]:
@@ -121,7 +207,9 @@ c1, c2 = st.columns([3, 2])
 with c1:
     url_input = st.text_input("Channel link or @handle", placeholder="https://www.youtube.com/@example or @example")
 with c2:
-    gemini_key = st.text_input("Gemini API Key (optional)", type="password", placeholder="AIza... or from HF secrets", help="Provide your own Google Gemini API key to add title analysis sheet.")
+    # Get API key from environment variable or user input
+    default_key = os.getenv("GEMINI_API_KEY", "")
+    gemini_key = st.text_input("Gemini API Key (optional)", type="password", placeholder="AIza... or from HF secrets", help="Provide your own Google Gemini API key to add title analysis sheet.", value=default_key)
 
 # Model selection for Gemini analysis (populated when key is provided)
 if gemini_key:
@@ -147,7 +235,8 @@ if run:
         with st.spinner("Collecting videos (may take a few minutes for large channels)..."):
             channel_title = ytdlp_extract_channel_title(base_url)
             clean_name = safe_filename(channel_title)
-            df = build_dataframe(videos_url)
+            # Use fast parallel version
+            df = build_dataframe_fast(videos_url, gemini_key, model_name, max_workers=10)
 
         if df.empty:
             st.error("No data extracted. Try the explicit /videos URL, e.g. https://www.youtube.com/@handle/videos")
@@ -155,24 +244,15 @@ if run:
             st.success(f"Found {len(df)} videos for '{channel_title}'.")
             st.dataframe(df.head(20), use_container_width=True)
 
-            analysis_df = pd.DataFrame()
-            if gemini_key:
-                with st.spinner("Analyzing titles with Gemini..."):
-                    analysis_df = analyze_titles_gemini(df["title"].astype(str).tolist(), gemini_key, model_name)
-            else:
-                st.info("No Gemini key provided. Skipping title analysis sheet.")
-
-            # Write Excel to memory with two sheets if analysis present
+            # Write Excel with single sheet containing analysis column
             output = BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 df.to_excel(writer, index=False, sheet_name="Videos")
-                if not analysis_df.empty:
-                    analysis_df.to_excel(writer, index=False, sheet_name="Title Analysis")
             output.seek(0)
 
             st.download_button(
                 label="Download Excel",
-                data=output.read(),
+                data=output.getvalue(),
                 file_name=f"{clean_name}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
