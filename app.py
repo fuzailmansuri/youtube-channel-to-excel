@@ -1,99 +1,224 @@
-import re
-from io import BytesIO
-from datetime import datetime
-from typing import List, Dict, Any
+#!/usr/bin/env python3
+"""
+app.py - Single-file web + API server using Python standard library only.
 
-import pandas as pd
-import streamlit as st
+Features:
+- Serves a minimal HTML single-page app at /
+- JSON API endpoints: GET /api/hello, POST /api/echo
+- Health check at /health
+- Graceful shutdown on SIGINT/SIGTERM
+- No external dependencies
+"""
 
-from scrape_youtube_channel import (
-    ytdlp_extract_channel_video_ids,
-    ytdlp_extract_video_details,
-    ytdlp_extract_channel_title,
-    safe_filename,
-)
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+import argparse
+import json
+import logging
+import threading
+import signal
+import sys
+import urllib.parse
+import webbrowser
+from typing import Tuple
+
+# Configuration defaults
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8000
+LOG = logging.getLogger("app")
+
+HTML_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Single-file App</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 2rem; }}
+    .card {{ border: 1px solid #ddd; padding: 1rem; border-radius: 6px; max-width: 600px; }}
+    pre {{ background:#f6f8fa; padding: .5rem; overflow:auto; }}
+    button {{ padding:.5rem 1rem; }}
+  </style>
+</head>
+<body>
+  <h1>Single-file App</h1>
+  <div class="card">
+    <p>This page demonstrates a minimal single-file Python web app and JSON API.</p>
+    <div>
+      <button id="helloBtn">Call /api/hello</button>
+      <button id="echoBtn">Call /api/echo</button>
+    </div>
+    <h3>Response</h3>
+    <pre id="out">No requests yet.</pre>
+  </div>
+
+  <script>
+    async function fetchJson(path, opts) {{
+      const resp = await fetch(path, opts);
+      const text = await resp.text();
+      let data;
+      try {{ data = JSON.parse(text); }} catch(e) {{ data = text; }}
+      return {{ status: resp.status, data }};
+    }}
+
+    document.getElementById('helloBtn').addEventListener('click', async () => {{
+      const name = prompt('Name (optional):');
+      const qs = name ? '?name=' + encodeURIComponent(name) : '';
+      const r = await fetchJson('/api/hello' + qs);
+      document.getElementById('out').textContent = JSON.stringify(r, null, 2);
+    }});
+
+    document.getElementById('echoBtn').addEventListener('click', async () => {{
+      const body = {{ time: new Date().toISOString(), note: 'sample' }};
+      const r = await fetchJson('/api/echo', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(body)
+      }});
+      document.getElementById('out').textContent = JSON.stringify(r, null, 2);
+    }});
+  </script>
+</body>
+</html>
+"""
 
 
-st.set_page_config(page_title="YouTube → Excel (yt-dlp)", page_icon="📊", layout="centered")
-st.title("YouTube Channel → Excel")
-st.write("Paste a YouTube channel link or @handle. The app will extract video Title, Views, Date, and Link and offer an Excel download.")
+def parse_query(path: str) -> Tuple[str, dict]:
+    """Return path without query and parsed query dict."""
+    parsed = urllib.parse.urlparse(path)
+    qs = urllib.parse.parse_qs(parsed.query)
+    # convert single-element lists to values
+    qs_simple = {k: v[0] if len(v) == 1 else v for k, v in qs.items()}
+    return parsed.path, qs_simple
 
 
-def normalize_channel_url(u: str) -> str:
-    u = u.strip()
-    if u.startswith("@"):
-        return f"https://www.youtube.com/{u}/videos"
-    if u.startswith("https://www.youtube.com/@") and "/videos" not in u:
-        return u.rstrip("/") + "/videos"
-    return u
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
 
-def base_channel_url(u: str) -> str:
-    b = u.strip()
-    if b.startswith("@"):
-        b = f"https://www.youtube.com/{b}"
-    return b.rstrip("/")
+class RequestHandler(BaseHTTPRequestHandler):
+    server_version = "SingleFileApp/1.0"
 
+    def _set_headers(self, status=200, content_type="application/json"):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        # Minimal CORS for convenience
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
-def build_dataframe(channel_videos_url: str) -> pd.DataFrame:
-    video_urls = ytdlp_extract_channel_video_ids(channel_videos_url)
-    rows: List[Dict[str, Any]] = []
-    total = len(video_urls)
-    prog = st.progress(0, text=f"Fetching details... 0/{total}")
-    for idx, url in enumerate(video_urls, start=1):
+    def do_OPTIONS(self):
+        self._set_headers()
+        # No body for OPTIONS
+
+    def do_GET(self):
+        path, qs = parse_query(self.path)
+        LOG.debug("GET %s qs=%s", path, qs)
+        if path == "/" or path == "/index.html":
+            content = HTML_PAGE.encode("utf-8")
+            self._set_headers(200, "text/html; charset=utf-8")
+            self.wfile.write(content)
+            return
+
+        if path == "/health":
+            self._set_headers(200)
+            self.wfile.write(json.dumps({"status": "ok"}).encode("utf-8"))
+            return
+
+        if path == "/api/hello":
+            name = qs.get("name") or "world"
+            resp = {"message": f"Hello, {name}!"}
+            self._set_headers(200)
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+            return
+
+        # Not found
+        self._set_headers(404)
+        self.wfile.write(json.dumps({"error": "not_found"}).encode("utf-8"))
+
+    def _read_json(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length <= 0:
+            return None
+        raw = self.rfile.read(content_length)
         try:
-            details = ytdlp_extract_video_details(url)
-            rows.append(details)
-        except Exception as e:
-            st.warning(f"Failed to fetch: {url} ({e})")
-        if total:
-            prog.progress(min(idx/total, 1.0), text=f"Fetching details... {idx}/{total}")
-    if not rows:
-        return pd.DataFrame(columns=["title", "views", "date", "link"])
-
-    df = pd.DataFrame(rows, columns=["title", "views", "date", "link"]).copy()
-
-    def date_key(x):
-        try:
-            return datetime.strptime(x, "%Y-%m-%d") if isinstance(x, str) else datetime.min
+            return json.loads(raw.decode("utf-8"))
         except Exception:
-            return datetime.min
+            return None
 
-    df = df.sort_values(by="date", key=lambda s: s.apply(date_key), ascending=False)
-    return df
+    def do_POST(self):
+        path, _ = parse_query(self.path)
+        LOG.debug("POST %s", path)
+        if path == "/api/echo":
+            data = self._read_json()
+            if data is None:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({"error": "invalid_json"}).encode("utf-8"))
+                return
+            # Echo back with server timestamp
+            resp = {"received": data, "server_time": threading.current_thread().name}
+            self._set_headers(200)
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+            return
+
+        self._set_headers(404)
+        self.wfile.write(json.dumps({"error": "not_found"}).encode("utf-8"))
+
+    def log_message(self, format, *args):
+        LOG.info("%s - - %s", self.address_string(), format % args)
 
 
-url_input = st.text_input("Channel link or @handle", placeholder="https://www.youtube.com/@example or @example")
-run = st.button("Run and Prepare Excel")
+def run_server(host: str, port: int, open_browser: bool):
+    server_address = (host, port)
+    httpd = ThreadingHTTPServer(server_address, RequestHandler)
+    LOG.info("Starting server at http://%s:%d", host, port)
 
-if run:
-    if not url_input.strip():
-        st.error("Please enter a channel link or @handle")
-    else:
-        videos_url = normalize_channel_url(url_input)
-        base_url = base_channel_url(url_input)
-        with st.spinner("Collecting videos (may take a few minutes for large channels)..."):
-            channel_title = ytdlp_extract_channel_title(base_url)
-            clean_name = safe_filename(channel_title)
-            df = build_dataframe(videos_url)
+    def handle_signal(signum, frame):
+        LOG.info("Signal %s received, shutting down...", signum)
+        # shutdown called from another thread is safe
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
 
-        if df.empty:
-            st.error("No data extracted. Try the explicit /videos URL, e.g. https://www.youtube.com/@handle/videos")
-        else:
-            st.success(f"Found {len(df)} videos for '{channel_title}'.")
-            st.dataframe(df.head(20), use_container_width=True)
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
-            # Write Excel to memory
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False)
-            output.seek(0)
+    if open_browser:
+        try:
+            webbrowser.open(f"http://{host}:{port}/")
+        except Exception:
+            LOG.debug("Failed to open browser", exc_info=True)
 
-            st.download_button(
-                label="Download Excel",
-                data=output.read(),
-                file_name=f"{clean_name}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        LOG.info("KeyboardInterrupt received, exiting.")
+    finally:
+        httpd.server_close()
+        LOG.info("Server stopped.")
 
-st.caption("Powered by yt-dlp + pandas + Streamlit")
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Single-file Python app (no externals).")
+    p.add_argument("--host", "-H", default=DEFAULT_HOST, help="Host to bind to (default: %(default)s)")
+    p.add_argument("--port", "-p", type=int, default=DEFAULT_PORT, help="Port to listen on (default: %(default)s)")
+    p.add_argument("--open", action="store_true", help="Open default web browser on start")
+    p.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    try:
+        run_server(args.host, args.port, args.open)
+    except OSError as e:
+        LOG.error("Failed to start server: %s", e)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
