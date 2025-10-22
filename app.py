@@ -1,224 +1,181 @@
-#!/usr/bin/env python3
-"""
-app.py - Single-file web + API server using Python standard library only.
+import re
+from io import BytesIO
+from datetime import datetime
+from typing import List, Dict, Any
 
-Features:
-- Serves a minimal HTML single-page app at /
-- JSON API endpoints: GET /api/hello, POST /api/echo
-- Health check at /health
-- Graceful shutdown on SIGINT/SIGTERM
-- No external dependencies
-"""
+import pandas as pd
+import streamlit as st
+import google.generativeai as genai
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
-import argparse
-import json
-import logging
-import threading
-import signal
-import sys
-import urllib.parse
-import webbrowser
-from typing import Tuple
-
-# Configuration defaults
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8000
-LOG = logging.getLogger("app")
-
-HTML_PAGE = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Single-file App</title>
-  <style>
-    body {{ font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 2rem; }}
-    .card {{ border: 1px solid #ddd; padding: 1rem; border-radius: 6px; max-width: 600px; }}
-    pre {{ background:#f6f8fa; padding: .5rem; overflow:auto; }}
-    button {{ padding:.5rem 1rem; }}
-  </style>
-</head>
-<body>
-  <h1>Single-file App</h1>
-  <div class="card">
-    <p>This page demonstrates a minimal single-file Python web app and JSON API.</p>
-    <div>
-      <button id="helloBtn">Call /api/hello</button>
-      <button id="echoBtn">Call /api/echo</button>
-    </div>
-    <h3>Response</h3>
-    <pre id="out">No requests yet.</pre>
-  </div>
-
-  <script>
-    async function fetchJson(path, opts) {{
-      const resp = await fetch(path, opts);
-      const text = await resp.text();
-      let data;
-      try {{ data = JSON.parse(text); }} catch(e) {{ data = text; }}
-      return {{ status: resp.status, data }};
-    }}
-
-    document.getElementById('helloBtn').addEventListener('click', async () => {{
-      const name = prompt('Name (optional):');
-      const qs = name ? '?name=' + encodeURIComponent(name) : '';
-      const r = await fetchJson('/api/hello' + qs);
-      document.getElementById('out').textContent = JSON.stringify(r, null, 2);
-    }});
-
-    document.getElementById('echoBtn').addEventListener('click', async () => {{
-      const body = {{ time: new Date().toISOString(), note: 'sample' }};
-      const r = await fetchJson('/api/echo', {{
-        method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify(body)
-      }});
-      document.getElementById('out').textContent = JSON.stringify(r, null, 2);
-    }});
-  </script>
-</body>
-</html>
-"""
+from scrape_youtube_channel import (
+    ytdlp_extract_channel_video_ids,
+    ytdlp_extract_video_details,
+    ytdlp_extract_channel_title,
+    safe_filename,
+)
 
 
-def parse_query(path: str) -> Tuple[str, dict]:
-    """Return path without query and parsed query dict."""
-    parsed = urllib.parse.urlparse(path)
-    qs = urllib.parse.parse_qs(parsed.query)
-    # convert single-element lists to values
-    qs_simple = {k: v[0] if len(v) == 1 else v for k, v in qs.items()}
-    return parsed.path, qs_simple
+st.set_page_config(page_title="YouTube → Excel (yt-dlp)", page_icon="📊", layout="centered")
+st.title("YouTube Channel → Excel")
+st.write("Paste a YouTube channel link or @handle. The app will extract video Title, Views, Date, and Link and offer an Excel download.")
 
 
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
+def normalize_channel_url(u: str) -> str:
+    u = u.strip()
+    if u.startswith("@"):
+        return f"https://www.youtube.com/{u}/videos"
+    if u.startswith("https://www.youtube.com/@") and "/videos" not in u:
+        return u.rstrip("/") + "/videos"
+    return u
 
 
-class RequestHandler(BaseHTTPRequestHandler):
-    server_version = "SingleFileApp/1.0"
+def base_channel_url(u: str) -> str:
+    b = u.strip()
+    if b.startswith("@"):
+        b = f"https://www.youtube.com/{b}"
+    return b.rstrip("/")
 
-    def _set_headers(self, status=200, content_type="application/json"):
-        self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store")
-        # Minimal CORS for convenience
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
 
-    def do_OPTIONS(self):
-        self._set_headers()
-        # No body for OPTIONS
-
-    def do_GET(self):
-        path, qs = parse_query(self.path)
-        LOG.debug("GET %s qs=%s", path, qs)
-        if path == "/" or path == "/index.html":
-            content = HTML_PAGE.encode("utf-8")
-            self._set_headers(200, "text/html; charset=utf-8")
-            self.wfile.write(content)
-            return
-
-        if path == "/health":
-            self._set_headers(200)
-            self.wfile.write(json.dumps({"status": "ok"}).encode("utf-8"))
-            return
-
-        if path == "/api/hello":
-            name = qs.get("name") or "world"
-            resp = {"message": f"Hello, {name}!"}
-            self._set_headers(200)
-            self.wfile.write(json.dumps(resp).encode("utf-8"))
-            return
-
-        # Not found
-        self._set_headers(404)
-        self.wfile.write(json.dumps({"error": "not_found"}).encode("utf-8"))
-
-    def _read_json(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length <= 0:
-            return None
-        raw = self.rfile.read(content_length)
+def build_dataframe(channel_videos_url: str) -> pd.DataFrame:
+    video_urls = ytdlp_extract_channel_video_ids(channel_videos_url)
+    rows: List[Dict[str, Any]] = []
+    total = len(video_urls)
+    prog = st.progress(0, text=f"Fetching details... 0/{total}")
+    for idx, url in enumerate(video_urls, start=1):
         try:
-            return json.loads(raw.decode("utf-8"))
-        except Exception:
-            return None
+            details = ytdlp_extract_video_details(url)
+            rows.append(details)
+        except Exception as e:
+            st.warning(f"Failed to fetch: {url} ({e})")
+        if total:
+            prog.progress(min(idx/total, 1.0), text=f"Fetching details... {idx}/{total}")
+    if not rows:
+        return pd.DataFrame(columns=["title", "views", "date", "link"])
 
-    def do_POST(self):
-        path, _ = parse_query(self.path)
-        LOG.debug("POST %s", path)
-        if path == "/api/echo":
-            data = self._read_json()
-            if data is None:
-                self._set_headers(400)
-                self.wfile.write(json.dumps({"error": "invalid_json"}).encode("utf-8"))
-                return
-            # Echo back with server timestamp
-            resp = {"received": data, "server_time": threading.current_thread().name}
-            self._set_headers(200)
-            self.wfile.write(json.dumps(resp).encode("utf-8"))
-            return
+    df = pd.DataFrame(rows, columns=["title", "views", "date", "link"]).copy()
 
-        self._set_headers(404)
-        self.wfile.write(json.dumps({"error": "not_found"}).encode("utf-8"))
-
-    def log_message(self, format, *args):
-        LOG.info("%s - - %s", self.address_string(), format % args)
-
-
-def run_server(host: str, port: int, open_browser: bool):
-    server_address = (host, port)
-    httpd = ThreadingHTTPServer(server_address, RequestHandler)
-    LOG.info("Starting server at http://%s:%d", host, port)
-
-    def handle_signal(signum, frame):
-        LOG.info("Signal %s received, shutting down...", signum)
-        # shutdown called from another thread is safe
-        threading.Thread(target=httpd.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-
-    if open_browser:
+    def date_key(x):
         try:
-            webbrowser.open(f"http://{host}:{port}/")
+            return datetime.strptime(x, "%Y-%m-%d") if isinstance(x, str) else datetime.min
         except Exception:
-            LOG.debug("Failed to open browser", exc_info=True)
+            return datetime.min
 
+    df = df.sort_values(by="date", key=lambda s: s.apply(date_key), ascending=False)
+    return df
+
+
+def analyze_titles_gemini(titles: List[str], api_key: str, model_name: str) -> pd.DataFrame:
+    """Return a DataFrame with columns: title, analysis (2-3 sentences)."""
+    if not api_key:
+        return pd.DataFrame(columns=["title", "analysis"])
     try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        LOG.info("KeyboardInterrupt received, exiting.")
-    finally:
-        httpd.server_close()
-        LOG.info("Server stopped.")
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(model_name or "gemini-1.5-flash")
+    except Exception as e:
+        st.error(f"Failed to initialize Gemini: {e}")
+        return pd.DataFrame(columns=["title", "analysis"])
+
+    rows = []
+    for t in titles:
+        prompt = (
+            "Analyze this YouTube video title and write a concise 2-3 sentence summary focusing on: "
+            "(1) the primary emotions it targets, and (2) any pattern or hook used. "
+            "Be direct and on-point. Title: '" + t + "'"
+        )
+        try:
+            resp = model.generate_content(prompt)
+            text = (resp.text or "").strip()
+        except Exception as e:
+            text = f"Analysis unavailable: {e}"
+        rows.append({"title": t, "analysis": text})
+    return pd.DataFrame(rows, columns=["title", "analysis"]) 
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Single-file Python app (no externals).")
-    p.add_argument("--host", "-H", default=DEFAULT_HOST, help="Host to bind to (default: %(default)s)")
-    p.add_argument("--port", "-p", type=int, default=DEFAULT_PORT, help="Port to listen on (default: %(default)s)")
-    p.add_argument("--open", action="store_true", help="Open default web browser on start")
-    p.add_argument("--verbose", "-v", action="store_true", help="Enable debug logging")
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+def list_gemini_models(api_key: str) -> List[str]:
+    """Return available Gemini model names supporting text generation for this key.
+    Falls back to common options if listing fails."""
+    default = [
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+        "gemini-1.5-flash-8b",
+    ]
+    if not api_key:
+        return default
     try:
-        run_server(args.host, args.port, args.open)
-    except OSError as e:
-        LOG.error("Failed to start server: %s", e)
-        sys.exit(1)
+        genai.configure(api_key=api_key)
+        names: List[str] = []
+        for m in genai.list_models():
+            # Different SDK versions expose different capabilities fields
+            methods = getattr(m, "supported_generation_methods", None)
+            if methods and ("generateContent" in methods or "generate_text" in methods):
+                names.append(m.name)
+        # Keep stable ordering: prefer common models first, then others
+        prioritized = [n for n in default if n in names]
+        others = [n for n in names if n not in prioritized]
+        return prioritized + others
+    except Exception:
+        return default
 
 
-if __name__ == "__main__":
-    main()
+c1, c2 = st.columns([3, 2])
+with c1:
+    url_input = st.text_input("Channel link or @handle", placeholder="https://www.youtube.com/@example or @example")
+with c2:
+    gemini_key = st.text_input("Gemini API Key (optional)", type="password", placeholder="AIza... or from HF secrets", help="Provide your own Google Gemini API key to add title analysis sheet.")
+
+# Model selection for Gemini analysis (populated when key is provided)
+if gemini_key:
+    available_models = list_gemini_models(gemini_key)
+else:
+    available_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-1.5-flash-8b"]
+
+model_name = st.selectbox(
+    "Gemini model",
+    options=available_models,
+    index=0 if available_models else None,
+    help="Choose the model for title analysis. Flash is fastest; Pro is higher quality but slower.",
+)
+
+run = st.button("Run and Prepare Excel")
+
+if run:
+    if not url_input.strip():
+        st.error("Please enter a channel link or @handle")
+    else:
+        videos_url = normalize_channel_url(url_input)
+        base_url = base_channel_url(url_input)
+        with st.spinner("Collecting videos (may take a few minutes for large channels)..."):
+            channel_title = ytdlp_extract_channel_title(base_url)
+            clean_name = safe_filename(channel_title)
+            df = build_dataframe(videos_url)
+
+        if df.empty:
+            st.error("No data extracted. Try the explicit /videos URL, e.g. https://www.youtube.com/@handle/videos")
+        else:
+            st.success(f"Found {len(df)} videos for '{channel_title}'.")
+            st.dataframe(df.head(20), use_container_width=True)
+
+            analysis_df = pd.DataFrame()
+            if gemini_key:
+                with st.spinner("Analyzing titles with Gemini..."):
+                    analysis_df = analyze_titles_gemini(df["title"].astype(str).tolist(), gemini_key, model_name)
+            else:
+                st.info("No Gemini key provided. Skipping title analysis sheet.")
+
+            # Write Excel to memory with two sheets if analysis present
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Videos")
+                if not analysis_df.empty:
+                    analysis_df.to_excel(writer, index=False, sheet_name="Title Analysis")
+            output.seek(0)
+
+            st.download_button(
+                label="Download Excel",
+                data=output.read(),
+                file_name=f"{clean_name}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+st.caption("Powered by yt-dlp + pandas + Streamlit")
+
